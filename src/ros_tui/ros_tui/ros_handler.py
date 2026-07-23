@@ -9,7 +9,6 @@ from rcl_interfaces.srv import GetParameters, ListParameters, SetParameters
 from rclpy.executors import Executor
 from rclpy.node import Node
 from rclpy.client import Client as ServiceClient
-from rclpy.parameter import Parameter as ROS2Parameter
 
 
 @dataclass(slots=True)

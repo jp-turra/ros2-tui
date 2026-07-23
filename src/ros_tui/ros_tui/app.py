@@ -102,13 +102,20 @@ class RosTuiApp(App[None]):
     def action_switch_theme(self) -> None:
         self.theme = "gruvbox" if self.theme == "nord" else "nord"
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "parameters":
+            await self.show_tab("parameters-tab")
+        elif event.button.id.endswith("-tab-close"):
+            tab_name = event.button.id[:-len("-close")]
             tab_content = self.query_one("#views", TabbedContent)
-            try:
-                tab_content.query_one("#parameters-tab")
-            except NoMatches:
-                tab_content.add_pane(ParametersTab(self.ros_handler))
+            await tab_content.remove_pane(tab_name)
+
+    async def show_tab(self, tab_name: str) -> None:
+        tab_content = self.query_one("#views", TabbedContent)
+        try:
+            tab_content.query_one(f"#{tab_name}")
+        except NoMatches:
+            await tab_content.add_pane(ParametersTab(self.ros_handler))
 
     def _spin_ros(self) -> None:
         if rclpy.ok():

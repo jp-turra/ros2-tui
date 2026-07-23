@@ -143,7 +143,7 @@ class ParametersTab(TabPane):
         padding: 1;
     }
 
-    #parameters-nodes-close,
+    #parameters-tab-close,
     #parameters-nodes-refresh {
         width: 100%;
         margin: 0 0 1 0;
@@ -197,6 +197,7 @@ class ParametersTab(TabPane):
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="parameters-scroll"):
             with Container(id="parameters-nodes"):
+                yield Button("Close Params", id="parameters-tab-close", compact=True)
                 yield Button("Refresh Nodes", id="parameters-nodes-refresh", compact=True)
                 yield ListView(id="parameters-nodes-list")
             with VerticalScroll(id="parameters-values"):
