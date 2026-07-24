@@ -17,6 +17,7 @@ from textual.widgets import (
 
 from ros_tui.ros_handler import ROS2Handler
 from ros_tui.parameter_tui import ParametersTab
+from ros_tui.service_tui import ServicesTab
 
 class RosTuiApp(App[None]):
     TITLE = "ROS2 TUI"
@@ -104,18 +105,20 @@ class RosTuiApp(App[None]):
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "parameters":
-            await self.show_tab("parameters-tab")
+            await self.show_tab("parameters-tab", ParametersTab)
+        if event.button.id == "services":
+            await self.show_tab("services-tab", ServicesTab)
         elif event.button.id.endswith("-tab-close"):
             tab_name = event.button.id[:-len("-close")]
             tab_content = self.query_one("#views", TabbedContent)
             await tab_content.remove_pane(tab_name)
 
-    async def show_tab(self, tab_name: str) -> None:
+    async def show_tab(self, tab_name: str, tab_class: type[TabPane] = TabPane) -> None:
         tab_content = self.query_one("#views", TabbedContent)
         try:
             tab_content.query_one(f"#{tab_name}")
         except NoMatches:
-            await tab_content.add_pane(ParametersTab(self.ros_handler))
+            await tab_content.add_pane(tab_class(self.ros_handler))
 
     def _spin_ros(self) -> None:
         if rclpy.ok():

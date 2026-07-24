@@ -12,6 +12,12 @@ from rclpy.client import Client as ServiceClient
 
 
 @dataclass(slots=True)
+class ServiceInfo:
+    name: str
+    type: str
+    client: ServiceClient | None
+
+@dataclass(slots=True)
 class ParameterInfo:
     name: str
     type_id: int
@@ -50,6 +56,8 @@ class ROS2Handler:
         self._list_parameters_clients: dict[str, ServiceClient] = {}
         self._get_parameters_clients: dict[str, ServiceClient] = {}
         self._set_parameters_clients: dict[str, ServiceClient] = {}
+
+        self._service_clients: dict[str, ServiceInfo] = {}
 
         self.node.declare_parameter(
             name="param_int",
@@ -163,6 +171,18 @@ class ROS2Handler:
 
         result = response.results[0]
         return result.successful, result.reason
+
+    def list_services(self):
+        services = self.node.get_service_names_and_types()
+
+        self._service_clients = {
+            name: ServiceInfo(name=name, type=types[0], client=None)
+            for name, types in services
+        }
+    
+    def get_servives(self):
+        return self._service_clients
+
 
     def _get_or_create_client(
         self,
