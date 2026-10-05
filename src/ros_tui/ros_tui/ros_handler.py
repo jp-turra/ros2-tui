@@ -2,13 +2,27 @@
 # Copyright (c) 2026, João Turra
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
-from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
-from rcl_interfaces.srv import GetParameters, ListParameters, SetParameters
+from rcl_interfaces.msg import Parameter, ParameterDescriptor, ParameterType, ParameterValue
+from rcl_interfaces.srv import (
+    DescribeParameters,
+    GetParameters,
+    ListParameters,
+    SetParameters,
+)
 from rclpy.executors import Executor
 from rclpy.node import Node
 from rclpy.client import Client as ServiceClient
+
+
+class CallStatus(Enum):
+    SUCCESS = "success"
+    UNAVAILABLE = "unavailable"
+    TIMEOUT = "timeout"
+    ERROR = "error"
+    REJECTED = "rejected"
 
 
 @dataclass(slots=True)
@@ -17,12 +31,35 @@ class ServiceInfo:
     type: str
     client: ServiceClient | None
 
+
+@dataclass(slots=True)
+class NumericRange:
+    from_value: float
+    to_value: float
+    step: float
+
+
 @dataclass(slots=True)
 class ParameterInfo:
     name: str
     type_id: int
     type_name: str
     value: Any
+    read_only: bool = False
+    description: str = ""
+    additional_constraints: str = ""
+    value_range: NumericRange | None = None
+
+
+@dataclass(slots=True)
+class ParameterResult:
+    status: CallStatus
+    message: str = ""
+    parameters: dict[str, ParameterInfo] = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        return self.status is CallStatus.SUCCESS
 
 
 @dataclass(slots=True)
@@ -56,21 +93,9 @@ class ROS2Handler:
         self._list_parameters_clients: dict[str, ServiceClient] = {}
         self._get_parameters_clients: dict[str, ServiceClient] = {}
         self._set_parameters_clients: dict[str, ServiceClient] = {}
+        self._describe_parameters_clients: dict[str, ServiceClient] = {}
 
         self._service_clients: dict[str, ServiceInfo] = {}
-
-        self.node.declare_parameter(
-            name="param_int",
-            value=0
-        )
-        self.node.declare_parameter(
-            name="param_double",
-            value=0.0
-        )
-        self.node.declare_parameter(
-            name="param_string",
-            value=""
-        )
 
     def list_nodes(self, include_parameters: bool = True) -> dict[str, NodeInfo]:
         nodes: dict[str, NodeInfo] = {}
@@ -80,7 +105,7 @@ class ROS2Handler:
             self.logger.debug(f"Found node '{full_name}'")
             node_info = NodeInfo(name=name, namespace=namespace, full_name=full_name)
             if include_parameters:
-                node_info.parameters = self.get_parameters(full_name)
+                node_info.parameters = self.get_parameters(full_name).parameters
             nodes[full_name] = node_info
 
         return nodes
@@ -89,36 +114,32 @@ class ROS2Handler:
         self,
         node_name: str,
         service_timeout_sec: float = 1.0,
-    ) -> list[str]:
-        client: ServiceClient = self._get_or_create_client(
+    ) -> tuple[CallStatus, list[str], str]:
+        client = self._get_or_create_client(
             self._list_parameters_clients,
             ListParameters,
             f"{node_name}/list_parameters",
         )
 
-        if not client.wait_for_service(timeout_sec=service_timeout_sec):
-            self.logger.debug(
-                f"Service unavailable for list_parameters on node '{node_name}'"
-            )
-            return []
-
         request = ListParameters.Request()
         request.depth = 0
 
-        response: ListParameters.Response = self._call_service(client, request, service_timeout_sec)
-        if response is None:
-            return []
+        status, response = self._call_service(client, request, service_timeout_sec)
+        if status is not CallStatus.SUCCESS:
+            return status, [], self._failure_message(status, client.srv_name)
 
-        return list(response.result.names)
+        return status, list(response.result.names), ""
 
     def get_parameters(
         self,
         node_name: str,
         service_timeout_sec: float = 1.0,
-    ) -> dict[str, ParameterInfo]:
-        names = self.list_parameter_names(node_name, service_timeout_sec)
+    ) -> ParameterResult:
+        status, names, message = self.list_parameter_names(node_name, service_timeout_sec)
+        if status is not CallStatus.SUCCESS:
+            return ParameterResult(status, message)
         if not names:
-            return {}
+            return ParameterResult(CallStatus.SUCCESS)
 
         client = self._get_or_create_client(
             self._get_parameters_clients,
@@ -126,22 +147,50 @@ class ROS2Handler:
             f"{node_name}/get_parameters",
         )
 
-        if not client.wait_for_service(timeout_sec=service_timeout_sec):
-            self.logger.debug(
-                f"Service unavailable for get_parameters on node '{node_name}'"
-            )
-            return {}
-
         request = GetParameters.Request()
         request.names = names
 
-        response: GetParameters.Response = self._call_service(client, request, service_timeout_sec)
-        if response is None:
+        status, response = self._call_service(client, request, service_timeout_sec)
+        if status is not CallStatus.SUCCESS:
+            return ParameterResult(status, self._failure_message(status, client.srv_name))
+
+        parameters = {
+            name: self._parameter_info(name, value)
+            for name, value in zip(names, response.values, strict=False)
+        }
+
+        # Descriptors only add metadata, so parameters are still shown if this fails.
+        for name, descriptor in self.describe_parameters(
+            node_name, names, service_timeout_sec
+        ).items():
+            if name in parameters:
+                self._apply_descriptor(parameters[name], descriptor)
+
+        return ParameterResult(CallStatus.SUCCESS, parameters=parameters)
+
+    def describe_parameters(
+        self,
+        node_name: str,
+        names: list[str],
+        service_timeout_sec: float = 1.0,
+    ) -> dict[str, ParameterDescriptor]:
+        client = self._get_or_create_client(
+            self._describe_parameters_clients,
+            DescribeParameters,
+            f"{node_name}/describe_parameters",
+        )
+
+        request = DescribeParameters.Request()
+        request.names = names
+
+        status, response = self._call_service(client, request, service_timeout_sec)
+        if status is not CallStatus.SUCCESS:
+            self.logger.debug(self._failure_message(status, client.srv_name))
             return {}
 
         return {
-            name: self._parameter_info(name, value)
-            for name, value in zip(names, response.values, strict=False)
+            name: descriptor
+            for name, descriptor in zip(names, response.descriptors, strict=False)
         }
 
     def set_parameter(
@@ -150,27 +199,36 @@ class ROS2Handler:
         parameter: ParameterInfo,
         value: Any,
         service_timeout_sec: float = 1.0,
-    ) -> tuple[bool, str]:
+    ) -> ParameterResult:
         client = self._get_or_create_client(
             self._set_parameters_clients,
             SetParameters,
             f"{node_name}/set_parameters",
         )
 
-        if not client.wait_for_service(timeout_sec=service_timeout_sec):
-            return False, f"Service unavailable for set_parameters on node '{node_name}'"
-
         request = SetParameters.Request()
         request.parameters = [
-            Parameter(name=parameter.name, value=self._parameter_value_message(parameter.type_id, value))
+            Parameter(
+                name=parameter.name,
+                value=self._parameter_value_message(parameter.type_id, value),
+            )
         ]
 
-        response: SetParameters.Response = self._call_service(client, request, service_timeout_sec)
-        if response is None or not response.results:
-            return False, f"Failed to set parameter '{parameter.name}' on node '{node_name}'"
+        status, response = self._call_service(client, request, service_timeout_sec)
+        if status is not CallStatus.SUCCESS:
+            return ParameterResult(status, self._failure_message(status, client.srv_name))
+
+        if not response.results:
+            return ParameterResult(CallStatus.ERROR, "empty response from set_parameters")
 
         result = response.results[0]
-        return result.successful, result.reason
+        if not result.successful:
+            return ParameterResult(
+                CallStatus.REJECTED,
+                result.reason or "parameter update rejected",
+            )
+
+        return ParameterResult(CallStatus.SUCCESS, result.reason)
 
     def list_services(self):
         services = self.node.get_service_names_and_types()
@@ -179,10 +237,9 @@ class ROS2Handler:
             name: ServiceInfo(name=name, type=types[0], client=None)
             for name, types in services
         }
-    
+
     def get_servives(self):
         return self._service_clients
-
 
     def _get_or_create_client(
         self,
@@ -201,7 +258,11 @@ class ROS2Handler:
         client: ServiceClient,
         request: Any,
         timeout_sec: float,
-    ) -> Any | None:
+    ) -> tuple[CallStatus, Any | None]:
+        if not client.wait_for_service(timeout_sec=timeout_sec):
+            self.logger.debug(f"Service '{client.srv_name}' is unavailable")
+            return CallStatus.UNAVAILABLE, None
+
         future = client.call_async(request)
         self.executor.spin_until_future_complete(future, timeout_sec=timeout_sec)
 
@@ -209,15 +270,23 @@ class ROS2Handler:
             self.logger.warning(
                 f"Timed out waiting for service '{client.srv_name}' response"
             )
-            return None
+            return CallStatus.TIMEOUT, None
 
         if future.exception() is not None:
             self.logger.warning(
                 f"Service '{client.srv_name}' failed: {future.exception()}"
             )
-            return None
+            return CallStatus.ERROR, None
 
-        return future.result()
+        return CallStatus.SUCCESS, future.result()
+
+    @staticmethod
+    def _failure_message(status: CallStatus, service_name: str) -> str:
+        if status is CallStatus.UNAVAILABLE:
+            return f"service '{service_name}' is unavailable"
+        if status is CallStatus.TIMEOUT:
+            return f"timed out waiting for '{service_name}'"
+        return f"service '{service_name}' failed"
 
     def _parameter_info(self, name: str, value: ParameterValue) -> ParameterInfo:
         return ParameterInfo(
@@ -226,6 +295,22 @@ class ROS2Handler:
             type_name=self._PARAMETER_TYPE_NAMES.get(value.type, "unknown"),
             value=self._parameter_value(value),
         )
+
+    @staticmethod
+    def _apply_descriptor(parameter: ParameterInfo, descriptor: ParameterDescriptor) -> None:
+        parameter.read_only = descriptor.read_only
+        parameter.description = descriptor.description
+        parameter.additional_constraints = descriptor.additional_constraints
+        if descriptor.integer_range:
+            int_range = descriptor.integer_range[0]
+            parameter.value_range = NumericRange(
+                int_range.from_value, int_range.to_value, int_range.step
+            )
+        elif descriptor.floating_point_range:
+            float_range = descriptor.floating_point_range[0]
+            parameter.value_range = NumericRange(
+                float_range.from_value, float_range.to_value, float_range.step
+            )
 
     def _parameter_value(self, value: ParameterValue) -> Any:
         if value.type == ParameterType.PARAMETER_BOOL:
@@ -237,7 +322,11 @@ class ROS2Handler:
         if value.type == ParameterType.PARAMETER_STRING:
             return value.string_value
         if value.type == ParameterType.PARAMETER_BYTE_ARRAY:
-            return list(value.byte_array_value)
+            # rclpy represents each byte as a length-1 bytes object.
+            return [
+                item[0] if isinstance(item, bytes) else int(item)
+                for item in value.byte_array_value
+            ]
         if value.type == ParameterType.PARAMETER_BOOL_ARRAY:
             return list(value.bool_array_value)
         if value.type == ParameterType.PARAMETER_INTEGER_ARRAY:
@@ -260,7 +349,7 @@ class ROS2Handler:
         elif type_id == ParameterType.PARAMETER_STRING:
             message.string_value = str(value)
         elif type_id == ParameterType.PARAMETER_BYTE_ARRAY:
-            message.byte_array_value = list(value)
+            message.byte_array_value = [bytes([int(item)]) for item in value]
         elif type_id == ParameterType.PARAMETER_BOOL_ARRAY:
             message.bool_array_value = list(value)
         elif type_id == ParameterType.PARAMETER_INTEGER_ARRAY:

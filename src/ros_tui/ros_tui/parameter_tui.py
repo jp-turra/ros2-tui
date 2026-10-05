@@ -1,25 +1,35 @@
 # SPDX-License-Identifier: GPL-3.0
 # Copyright (c) 2026, João Turra
 
-import ast
-
-from textual import events
 from textual.app import ComposeResult
 from textual.message import Message
 from textual.containers import Container, VerticalScroll
+from textual.widget import Widget
 from textual.widgets import (
     Button,
     Checkbox,
+    Collapsible,
     Input,
     Label,
     ListItem,
     ListView,
     Static,
     TabPane,
-    TextArea,
 )
 
-from ros_tui.ros_handler import ParameterInfo, ROS2Handler
+from ros_tui.parameter_values import coerce_parameter_value, format_parameter_value
+from ros_tui.ros_handler import CallStatus, ParameterInfo, ROS2Handler
+
+TEXT_EDITOR_TYPES = {
+    "integer",
+    "double",
+    "string",
+    "byte_array",
+    "bool_array",
+    "integer_array",
+    "double_array",
+    "string_array",
+}
 
 
 class NodeListItem(ListItem):
@@ -42,14 +52,33 @@ class ParameterView(Container):
         layout: horizontal;
         padding: 0 1;
         margin: 0 0 1 0;
+        border-left: blank;
     }
 
-    ParameterView:focus {
+    ParameterView:focus-within {
         background: $accent 20%;
+    }
+
+    ParameterView.-dirty {
+        border-left: thick $warning;
+    }
+
+    ParameterView.-ok {
+        border-left: thick $success;
+    }
+
+    ParameterView.-error {
+        border-left: thick $error;
     }
 
     .parameter-name {
         width: 40%;
+        content-align: left middle;
+    }
+
+    .parameter-type {
+        width: 14;
+        color: $text-muted;
         content-align: left middle;
     }
 
@@ -58,71 +87,105 @@ class ParameterView(Container):
     }
     """
 
+    STATE_CLASSES = ("-dirty", "-ok", "-error")
+
     class Submitted(Message):
-        def __init__(self, parameter: ParameterInfo, value: object) -> None:
+        def __init__(self, view: "ParameterView", value: object) -> None:
             super().__init__()
-            self.parameter = parameter
+            self.view = view
             self.value = value
 
     def __init__(self, parameter: ParameterInfo) -> None:
         super().__init__()
         self.parameter = parameter
-        self.value = ParametersTab._coerce_parameter_value(parameter, parameter.value)
-        self.value_str = ""
 
     def compose(self) -> ComposeResult:
         yield Label(self.parameter.name, classes="parameter-name")
-        yield self._get_editor_widget()
+        yield Label(self.parameter.type_name, classes="parameter-type")
+        yield self._create_editor()
 
-    def _get_editor_widget(self):
-        param_id = self.parameter.name.replace(".", "-").replace("/", "-")
-        value = self.parameter.value
+    def on_mount(self) -> None:
+        tooltip = self._tooltip_text()
+        if tooltip:
+            self.tooltip = tooltip
 
-        if self.parameter.type_name == "bool":
-            return FilledCheckbox("", self.value, classes="parameter-editor", id=param_id, compact=True)
+    def _create_editor(self) -> Widget:
+        parameter = self.parameter
 
-        if self.parameter.type_name in {"integer", "double", "string"}:
-            self.value_str = str(value)
-            return Input(
-                value=self.value_str,
+        if parameter.type_name == "bool":
+            return FilledCheckbox(
+                "",
+                bool(parameter.value),
                 classes="parameter-editor",
-                id=param_id,
                 compact=True,
+                disabled=parameter.read_only,
             )
 
-        if self.parameter.type_name.endswith("_array") or self.parameter.type_name == "byte_array":
-            self.value_str = ", ".join(str(item) for item in value) if value else ""
-            return TextArea(self.value_str, classes="parameter-editor", id=param_id, compact=True)
+        if parameter.type_name in TEXT_EDITOR_TYPES:
+            return Input(
+                value=format_parameter_value(parameter, parameter.value),
+                classes="parameter-editor",
+                compact=True,
+                disabled=parameter.read_only,
+            )
 
         return Static(
-            "unset" if value is None else str(value),
+            "unset" if parameter.value is None else str(parameter.value),
             classes="parameter-editor",
-            id=param_id,
         )
 
-    def on_key(self, event: events.Key) -> None:
-        if event.key != "enter":
-            return
+    def _tooltip_text(self) -> str:
+        parameter = self.parameter
+        lines = []
+        if parameter.description:
+            lines.append(parameter.description)
+        if parameter.value_range is not None:
+            value_range = parameter.value_range
+            text = f"Range: [{value_range.from_value}, {value_range.to_value}]"
+            if value_range.step:
+                text += f", step {value_range.step}"
+            lines.append(text)
+        if parameter.additional_constraints:
+            lines.append(f"Constraints: {parameter.additional_constraints}")
+        if parameter.read_only:
+            lines.append("Read-only")
+        return "\n".join(lines)
 
+    def on_input_changed(self, event: Input.Changed) -> None:
         event.stop()
-        self.post_message(self.Submitted(self.parameter, self._current_value()))
+        current = format_parameter_value(self.parameter, self.parameter.value)
+        self.mark("-dirty" if event.value != current else None)
 
-    def _current_value(self) -> object:
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self.post_message(self.Submitted(self, event.value))
+
+    def on_checkbox_changed(self, event: Checkbox.Changed) -> None:
+        event.stop()
+        self.post_message(self.Submitted(self, event.value))
+
+    def mark(self, state: str | None) -> None:
+        """Show the edit state: -dirty, -ok, -error, or None to clear it."""
+        self.remove_class(*self.STATE_CLASSES)
+        if state is not None:
+            self.add_class(state)
+
+    def reset_editor(self) -> None:
+        """Show the parameter's last known value without submitting it again."""
         editor = self.query_one(".parameter-editor")
         if isinstance(editor, Checkbox):
-            return editor.value
-        if isinstance(editor, Input):
-            return editor.value
-        if isinstance(editor, TextArea):
-            return editor.text
-        return self.parameter.value
+            with editor.prevent(Checkbox.Changed):
+                editor.value = bool(self.parameter.value)
+        elif isinstance(editor, Input):
+            with editor.prevent(Input.Changed):
+                editor.value = format_parameter_value(self.parameter, self.parameter.value)
 
 
 class ParametersTab(TabPane):
     DEFAULT_CSS = """
     VerticalScroll {
         width: 1fr;
-        height: 1fr;    
+        height: 1fr;
     }
 
     #parameters-tab {
@@ -168,11 +231,15 @@ class ParametersTab(TabPane):
         color: $text-muted;
     }
 
-    #parameters-help,
-    #parameters-save-status {
+    #parameters-help {
         width: 100%;
         height: auto;
         color: $text-muted;
+        margin: 0 0 1 0;
+    }
+
+    #parameters-filter {
+        width: 100%;
         margin: 0 0 1 0;
     }
 
@@ -186,7 +253,7 @@ class ParametersTab(TabPane):
     #parameters-values-refresh {
         margin: 0 2;
     }
-    
+
     """
 
     def __init__(self, handler: ROS2Handler, **kwargs) -> None:
@@ -210,7 +277,7 @@ class ParametersTab(TabPane):
         if event.button.id == "parameters-nodes-refresh":
             await self.refresh_node_list()
 
-        if event.button.id == "parameters-values-refresh":
+        if event.button.id == "parameters-values-refresh" and self.selected_node_name is not None:
             await self.show_parameters(self.selected_node_name)
 
         if event.button.id == "parameters-values-close":
@@ -241,11 +308,17 @@ class ParametersTab(TabPane):
 
     async def show_parameters(self, node_name: str) -> None:
         self.selected_node_name = node_name
-        parameters = self.ros_handler.get_parameters(node_name)
+        result = self.ros_handler.get_parameters(node_name)
         values_container = self.query_one("#parameters-values", VerticalScroll)
         await values_container.remove_children()
 
-        if not parameters:
+        if not result.ok:
+            message = f"Could not load parameters for {node_name}: {result.message}"
+            await values_container.mount(Static(message, id="parameters-values-empty"))
+            self.app.notify(message, title="Parameters", severity="error")
+            return
+
+        if not result.parameters:
             await values_container.mount(
                 Static(f"No parameters available for {node_name}.", id="parameters-values-empty")
             )
@@ -260,80 +333,82 @@ class ParametersTab(TabPane):
             )
         )
         await values_container.mount(
-            Static("Focus a parameter and press Enter to apply the edited value.", id="parameters-help")
+            Static(
+                "Edit a value and press Enter to apply it. Checkboxes apply immediately.",
+                id="parameters-help",
+            )
         )
-        await values_container.mount(Static("", id="parameters-save-status"))
+        await values_container.mount(
+            Input(placeholder="Filter parameters", id="parameters-filter", compact=True)
+        )
+        await values_container.mount_all(self._parameter_widgets(result.parameters))
+
+    @staticmethod
+    def _parameter_widgets(parameters: dict[str, ParameterInfo]) -> list[Widget]:
+        """Build parameter views, grouping dotted names under their first segment."""
+        ungrouped: list[Widget] = []
+        groups: dict[str, list[ParameterView]] = {}
         for parameter in sorted(parameters.values(), key=lambda param: param.name):
-            await values_container.mount(ParameterView(parameter))
+            prefix, separator, _ = parameter.name.partition(".")
+            if separator:
+                groups.setdefault(prefix, []).append(ParameterView(parameter))
+            else:
+                ungrouped.append(ParameterView(parameter))
+
+        return ungrouped + [
+            Collapsible(*views, title=prefix, collapsed=False, classes="parameter-group")
+            for prefix, views in groups.items()
+        ]
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "parameters-filter":
+            return
+
+        query = event.value.strip().lower()
+        for view in self.query(ParameterView):
+            view.display = query in view.parameter.name.lower()
+        for group in self.query(".parameter-group").results(Collapsible):
+            group.display = any(view.display for view in group.query(ParameterView))
 
     def on_parameter_view_submitted(self, event: ParameterView.Submitted) -> None:
-        status = self.query_one("#parameters-save-status", Static)
+        view = event.view
+        parameter = view.parameter
         if self.selected_node_name is None:
-            status.update("No node selected.")
+            self.app.notify("No node selected.", severity="warning")
+            return
+
+        if parameter.read_only:
+            view.reset_editor()
+            view.mark("-error")
+            self.app.notify(f"{parameter.name} is read-only.", severity="warning")
             return
 
         try:
-            value = self._coerce_parameter_value(event.parameter, event.value)
+            value = coerce_parameter_value(parameter, event.value)
         except ValueError as exc:
-            status.update(f"Invalid value for {event.parameter.name}: {exc}")
+            view.mark("-error")
+            self.app.notify(
+                f"Invalid value for {parameter.name}: {exc}",
+                title=self.selected_node_name,
+                severity="error",
+            )
             return
 
-        success, reason = self.ros_handler.set_parameter(
-            self.selected_node_name,
-            event.parameter,
-            value,
-        )
-        if success:
-            event.parameter.value = value
-            status.update(f"Updated {event.parameter.name} = {value}")
+        result = self.ros_handler.set_parameter(self.selected_node_name, parameter, value)
+        if result.ok:
+            parameter.value = value
+            view.reset_editor()
+            view.mark("-ok")
+            self.app.notify(
+                f"Updated {parameter.name} = {format_parameter_value(parameter, value)}",
+                title=self.selected_node_name,
+            )
             return
 
-        status.update(
-            f"Failed to update {event.parameter.name}: "
-            f"{reason or 'parameter update rejected'}"
+        view.reset_editor()
+        view.mark("-error")
+        self.app.notify(
+            f"Failed to update {parameter.name}: {result.message}",
+            title=self.selected_node_name,
+            severity="warning" if result.status is CallStatus.REJECTED else "error",
         )
-
-    @staticmethod
-    def _coerce_parameter_value(parameter: ParameterInfo, raw_value: object) -> object:
-        if parameter.type_name == "bool":
-            if isinstance(raw_value, bool):
-                return raw_value
-            return ParametersTab._parse_bool(raw_value)
-        if parameter.type_name == "integer":
-            return int(str(raw_value).strip())
-        if parameter.type_name == "double":
-            return float(str(raw_value).strip())
-        if parameter.type_name == "string":
-            return "" if raw_value is None else str(raw_value)
-        if parameter.type_name == "byte_array":
-            return [int(item) for item in ParametersTab._parse_array(raw_value)]
-        if parameter.type_name == "bool_array":
-            return [ParametersTab._parse_bool(item) for item in ParametersTab._parse_array(raw_value)]
-        if parameter.type_name == "integer_array":
-            return [int(item) for item in ParametersTab._parse_array(raw_value)]
-        if parameter.type_name == "double_array":
-            return [float(item) for item in ParametersTab._parse_array(raw_value)]
-        if parameter.type_name == "string_array":
-            return [str(item) for item in ParametersTab._parse_array(raw_value)]
-        return raw_value
-
-    @staticmethod
-    def _parse_array(raw_value: object) -> list[object]:
-        text = "" if raw_value is None else str(raw_value).strip()
-        if not text:
-            return []
-        if text.startswith("["):
-            parsed = ast.literal_eval(text)
-            if not isinstance(parsed, list):
-                raise ValueError("expected a list")
-            return parsed
-        return [item.strip() for item in text.split(",")]
-
-    @staticmethod
-    def _parse_bool(value: object) -> bool:
-        text = str(value).strip().lower()
-        if text in {"true", "1", "yes", "on"}:
-            return True
-        if text in {"false", "0", "no", "off"}:
-            return False
-        raise ValueError(f"invalid boolean '{value}'")
